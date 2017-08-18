@@ -15,7 +15,7 @@ def test_safe(func):
     def func_wrapper(*args):
         with tf.Graph().as_default():
             result = func(*args)
-        print('Tests Passed')
+        print('Tests Passed', '...', func.__name__)
         return result
 
     return func_wrapper
@@ -104,6 +104,8 @@ def test_optimize(optimize):
 
     with tf.Session() as sess:
         sess.run(tf.global_variables_initializer())
+        # Needed by mean_iou
+        sess.run(tf.local_variables_initializer())
         sess.run([train_op], {correct_label: np.arange(np.prod(shape)).reshape(shape), learning_rate: 10})
         test, loss = sess.run([layers_output, cross_entropy_loss], {correct_label: np.arange(np.prod(shape)).reshape(shape)})
 
