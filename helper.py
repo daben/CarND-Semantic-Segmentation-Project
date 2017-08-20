@@ -10,6 +10,8 @@ import tensorflow as tf
 from glob import glob
 from urllib.request import urlretrieve
 from tqdm import tqdm
+import matplotlib.colors
+import scipy.ndimage
 
 
 class DLProgress(tqdm):
@@ -98,6 +100,25 @@ def gen_batch_function(data_folder, image_shape):
     return get_batches_fn
 
 
+def paste_segmentation(image, segmentation):
+    if segmentation.shape[-1] == 2:
+        segmentation = segmentation[..., 1:2]
+    mask = np.dot(segmentation, np.array([[0, 255, 0, 127]], dtype=np.uint8))
+    mask = scipy.misc.toimage(mask, mode="RGBA")
+    street_im = scipy.misc.toimage(image)
+    street_im.paste(mask, box=None, mask=mask)
+    return scipy.misc.fromimage(street_im, mode="RGB")
+
+def generate_street_images(sess, images, logits, keep_prob, input_image, image_shape):
+    results = sess.run([tf.nn.softmax(logits)], {input_image: images, keep_prob: 1.0})
+    im_softmax = results[0]
+    im_softmax = im_softmax[:, 1].reshape(len(images), image_shape[0], image_shape[1])
+    street_images = np.zeros((len(images), image_shape[0], image_shape[1], 3), dtype=np.uint8)
+    for i in range(len(images)):
+        segmentation = (im_softmax[i] > 0.5).reshape(image_shape[0], image_shape[1], 1)
+        street_images[i] = paste_segmentation(images[i], segmentation)
+    return street_images
+
 def gen_test_output(sess, logits, keep_prob, image_pl, data_folder, image_shape):
     """
     Generate test output using the test images
@@ -138,3 +159,72 @@ def save_inference_samples(runs_dir, data_dir, sess, image_shape, logits, keep_p
         sess, logits, keep_prob, input_image, os.path.join(data_dir, 'data_road/testing'), image_shape)
     for name, image in image_outputs:
         scipy.misc.imsave(os.path.join(output_dir, name), image)
+
+    # Save model checkpoint
+    saver = tf.train.Saver()
+    save_path = saver.save(sess, os.path.join(output_dir, 'fcn.ckpt'))
+    print('Model checkpoint saved to: {}'.format(save_path))
+
+
+def augment_shadow(image):
+    h, w = image.shape[0], image.shape[1]
+    x1, x2 = np.random.choice(w, 2, replace=False)
+    k = h / (x2 - x1)
+    b = - k * x1
+    random_bright = random.uniform(.4, .6)
+    shadowed = image.copy()
+    for i in range(h):
+        c = int((i - b) / k)
+        shadowed[i, :c, :] = np.clip(image[i, :c, :] * random_bright, 0, 255)
+    return shadowed
+
+def augment_brightness(image, bright=None):
+    if bright is None:
+        bright = random.uniform(.25, 1.5)
+    hsv = matplotlib.colors.rgb_to_hsv(image/255)
+    hsv[..., 2] = hsv[..., 2] * bright
+    rgb = matplotlib.colors.hsv_to_rgb(hsv)
+    return np.clip(rgb * 255, 0, 255).astype(np.uint8)
+
+def augment_scale(image, mask, mode='constant'):
+    s = random.uniform(0.8, 1)
+    matrix = np.eye(2,2) * s
+    offset = 0.5 * np.array(image.shape[:2])
+    offset -= np.dot(offset, matrix)
+    
+    transformed_image = np.zeros_like(image)
+    for i in range(image.shape[-1]):
+        transformed_image[..., i] = scipy.ndimage.affine_transform(image[..., i], matrix, offset, mode=mode)
+
+    transformed_mask = np.zeros_like(mask)
+    for i in range(mask.shape[2]):
+        transformed_mask[..., i] = scipy.ndimage.affine_transform(mask[..., i] * 255, matrix, offset, mode=mode) != 0
+
+    return transformed_image, transformed_mask
+
+def augment_image(image, label):
+    image = augment_brightness(image)
+    image = augment_shadow(image)
+    # FIXME This is not working
+    # image, label = augment_scale(image, label)
+    if random.random() < 0.5:
+        # Flip horizontally
+        image = image[:, ::-1, :]
+        label = label[:, ::-1, :]
+    return image, label
+
+def augment_images(images, labels):
+    target_images = np.zeros_like(images)
+    target_labels = np.zeros_like(labels)
+    for i in range(len(images)):
+        target_images[i], target_labels[i] = augment_image(images[i], labels[i])
+    return target_images, target_labels
+
+
+def gen_augmented_batch_function(get_batches_fn, num_batches):
+    def get_augmented_batches_fn(batch_size):
+        for batch in range(num_batches):
+            images, gt_images = next(get_batches_fn(batch_size))
+            aug_images, aug_gt_images = augment_images(images, gt_images)
+            yield aug_images, aug_gt_images
+    return get_augmented_batches_fn

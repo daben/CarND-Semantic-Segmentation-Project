@@ -3,6 +3,7 @@ import os
 from copy import deepcopy
 from glob import glob
 from unittest import mock
+import logging
 
 import numpy as np
 import tensorflow as tf
@@ -23,8 +24,11 @@ def test_safe(func):
 
 def _prevent_print(function, params):
     sys.stdout = open(os.devnull, "w")
+    logger = logging.getLogger("segmentation")
+    logger.setLevel(logging.ERROR)
     function(**params)
     sys.stdout = sys.__stdout__
+    logger.setLevel(logging.INFO)
 
 
 def _assert_tensor_shape(tensor, shape, display_name):

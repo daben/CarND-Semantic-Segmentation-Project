@@ -1,6 +1,8 @@
 import logging
-logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s', level=logging.INFO)
+logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s')
 logger = logging.getLogger("segmentation")
+logger.setLevel(logging.INFO)
+
 
 import os.path
 import math
@@ -22,7 +24,7 @@ if not tf.test.gpu_device_name():
 else:
     print('Default GPU Device: {}'.format(tf.test.gpu_device_name()))
 
-
+tf.set_random_seed(20170818)
 
 
 def load_vgg(sess, vgg_path):
@@ -34,23 +36,16 @@ def load_vgg(sess, vgg_path):
     """
     vgg_tag = 'vgg16'
 
-    vgg_model = tf.saved_model.loader.load(sess, [vgg_tag], vgg_path)
+    tensor_names = ('image_input:0', 
+                    'keep_prob:0', 
+                    'layer3_out:0', 
+                    'layer4_out:0', 
+                    'layer7_out:0')
 
+    model = tf.saved_model.loader.load(sess, [vgg_tag], vgg_path)
     graph = tf.get_default_graph()
 
-    vgg_input_tensor_name = 'image_input:0'
-    vgg_keep_prob_tensor_name = 'keep_prob:0'
-    vgg_layer3_out_tensor_name = 'layer3_out:0'
-    vgg_layer4_out_tensor_name = 'layer4_out:0'
-    vgg_layer7_out_tensor_name = 'layer7_out:0'
-    
-    vgg_input_tensor = graph.get_tensor_by_name(vgg_input_tensor_name)
-    vgg_keep_prob_tensor = graph.get_tensor_by_name(vgg_keep_prob_tensor_name)
-    vgg_layer3_out_tensor = graph.get_tensor_by_name(vgg_layer3_out_tensor_name)
-    vgg_layer4_out_tensor = graph.get_tensor_by_name(vgg_layer4_out_tensor_name)
-    vgg_layer7_out_tensor = graph.get_tensor_by_name(vgg_layer7_out_tensor_name)
-
-    return vgg_input_tensor, vgg_keep_prob_tensor, vgg_layer3_out_tensor, vgg_layer4_out_tensor, vgg_layer7_out_tensor
+    return tuple(map(graph.get_tensor_by_name, tensor_names))
 
 tests.test_load_vgg(load_vgg, tf)
 
@@ -65,31 +60,30 @@ def layers(vgg_layer3_out, vgg_layer4_out, vgg_layer7_out, num_classes):
     :return: The Tensor for the last layer of output
     """
 
+    def conv1x1(inputs, num_outputs, name):
+        return tf.layers.conv2d(inputs, num_outputs, kernel_size=1, strides=1,
+                                name=name, kernel_initializer=tf.truncated_normal_initializer(stddev=0.01))
+
+    def deconv2d(inputs, filters, kernel_size, strides, name):
+        return tf.layers.conv2d_transpose(inputs, filters,
+                    kernel_size=kernel_size, strides=(strides, strides), 
+                    padding="same", name=name, 
+                    kernel_initializer=tf.truncated_normal_initializer(stddev=0.01))
+
     # FCN-8 Decoder
-
-    # Replace the linear layers by 1x1 convolutions
-    layer7_logits = tf.layers.conv2d(vgg_layer7_out, num_classes, kernel_size=1, strides=(1,1))
-    layer4_logits = tf.layers.conv2d(vgg_layer4_out, num_classes, kernel_size=1, strides=(1,1))   
-    layer3_logits = tf.layers.conv2d(vgg_layer3_out, num_classes, kernel_size=1, strides=(1,1))
-
-    # Upsample the input to the original image size.
-    output = tf.layers.conv2d_transpose(layer7_logits, num_classes, 
-                                        kernel_size=4, strides=(2, 2), padding='same')
-
-    # skip connections
-
-    # fuse layers
-    output = tf.add(output, layer4_logits)
-    output = tf.layers.conv2d_transpose(output, num_classes, 
-                                        kernel_size=4, strides=(2, 2), padding='same')
-
-    # fuse layers
-    output = tf.add(output, layer3_logits)
-    output = tf.layers.conv2d_transpose(output, num_classes, 
-                                        kernel_size=16, strides=(8, 8), padding='same')
+    with tf.variable_scope("fcn_decoder"):
+        # Replace the linear layers by 1x1 convolutions
+        layer7_logits = conv1x1(vgg_layer7_out, num_classes, name="vgg_layer7_logits")
+        layer4_logits = conv1x1(vgg_layer4_out, num_classes, name="vgg_layer4_logits")
+        layer3_logits = conv1x1(vgg_layer3_out, num_classes, name="vgg_layer3_logits")
+        # Upsample x2 the input to the original image size.
+        layer1 = deconv2d(layer7_logits, num_classes, 4, 2, name="layer1")
+        # skip connections
+        layer2 = deconv2d(tf.add(layer1, layer4_logits), num_classes, 4, 2, name="layer2")
+        layer3 = deconv2d(tf.add(layer2, layer3_logits), num_classes, 16, 8, name="layer3")
 
     # decoder output layer
-    return output
+    return layer3
 
 tests.test_layers(layers)
 
@@ -104,47 +98,54 @@ def optimize(nn_last_layer, correct_label, learning_rate, num_classes, global_st
     :return: Tuple of (logits, train_op, cross_entropy_loss)
     """
     
-    # Make logits 2D
+    # Make logits and labels 2D
     # each row represents a pixel and each column a class
     logits = tf.reshape(nn_last_layer, (-1, num_classes))
-    # Retrieve the labels vector
-    labels = tf.argmax(tf.reshape(correct_label, (-1, num_classes)), 1)
+    labels = tf.reshape(correct_label, (-1, num_classes))
 
     # Cross entropy loss
-    # cross_entropy_loss = tf.reduce_mean(
-    #     tf.nn.sparse_softmax_cross_entropy_with_logits(labels=correct_label, logits=logits))
     cross_entropy_loss = tf.reduce_mean(
-            tf.nn.softmax_cross_entropy_with_logits(labels=correct_label, logits=logits))
+            tf.nn.softmax_cross_entropy_with_logits(labels=labels, logits=logits))
 
-    tf.add_to_collection("losses", cross_entropy_loss)
-    tf.summary.scalar('cross_entropy', cross_entropy_loss)
+    tf.summary.scalar("cross_entropy_loss", cross_entropy_loss)
 
-    # IoU loss
-    iou, iou_op = tf.metrics.mean_iou(labels, tf.argmax(logits, 1), num_classes)
-    with tf.control_dependencies([iou_op]):
-        iou_loss = tf.subtract(tf.constant(1.0), iou)
+    if False: # Try to maximize also IoU
+        tf.add_to_collection("losses", cross_entropy_loss)
+        
+        # IoU loss
+        iou, iou_op = tf.metrics.mean_iou(tf.argmax(labels, 1), tf.argmax(logits, 1), num_classes)
+        with tf.control_dependencies([iou_op]):
+            iou_loss = tf.subtract(tf.constant(1.0), iou)
         tf.add_to_collection("losses", iou_loss)
-    tf.summary.scalar('mean_iou', iou)
+        tf.summary.scalar("mean_iou_loss", iou_loss)
 
-    # Compute final loss function
-    loss = tf.add_n(tf.get_collection("losses"), name='loss')
+        # Final loss function
+        loss = tf.reduce_sum(tf.stack(tf.get_collection("losses")), name='loss')
+    else:
+        loss = cross_entropy_loss
 
     # Evaluation
     # correct_prediction = tf.equal(tf.argmax(logits, 1), labels)
     # accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32), name='accuracy')
     # tf.summary.scalar('accuracy', accuracy)
 
+    # Our dataset is too small to fine tune the VGG layers. Here we select only the decoder
+    # layers and we will pass this list to the optimizer.
+    trainable = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, "fcn_decoder/")
+    if not len(trainable):
+        # The scope is not defined, train everything. This will happen in the test function.
+        trainable = None
+
     # Train operation
-    train_op = (tf.train.AdamOptimizer(learning_rate).
-                    minimize(loss, global_step=global_step))
+    train_op = tf.train.AdamOptimizer(learning_rate).minimize(loss, var_list=trainable, global_step=global_step)
 
     return logits, train_op, loss
 
 tests.test_optimize(optimize)
 
 
-def train_nn(sess, epochs, batch_size, get_batches_fn, train_op, cross_entropy_loss,
-             input_image, correct_label, keep_prob, learning_rate, logs_dir=None, total_steps=0):
+def train_nn(sess, epochs, batch_size, get_batches_fn, train_op, cross_entropy_loss, input_image,
+             correct_label, keep_prob, learning_rate, **kwargs):
     """
     Train neural network and print out the loss during training.
     :param sess: TF Session
@@ -152,68 +153,89 @@ def train_nn(sess, epochs, batch_size, get_batches_fn, train_op, cross_entropy_l
     :param batch_size: Batch size
     :param get_batches_fn: Function to get batches of training data.  Call using get_batches_fn(batch_size)
     :param train_op: TF Operation to train the neural network
-    :param loss: TF Tensor for the amount of loss
+    :param cross_entropy_loss: TF Tensor for the amount of loss
     :param input_image: TF Placeholder for input images
     :param correct_label: TF Placeholder for label images
     :param keep_prob: TF Placeholder for dropout keep probability
     :param learning_rate: TF Placeholder for learning rate
-    :param logs_dir: path where train summary is written
-    :param total_steps: number of total steps
     """
 
-    log_summary = False
+    # Keep compatibility with project_tests.py
+    loss = cross_entropy_loss
 
-    if logs_dir is not None:
+    log_summary = 'log_summary' in kwargs
+
+    if log_summary:
+        logs_dir = kwargs['logs_dir']
+        logits = kwargs['logits']
+        image_shape = kwargs['image_shape']
+        #testing_data_dir = kwargs['testing_data_dir']
+
+        # Place holder for output image
+        output_images = tf.placeholder(tf.uint8, (None, image_shape[0], image_shape[1], 3))
+        tf.summary.image('output_images', output_images)
+
+        output_labels = tf.placeholder(tf.uint8, (None, image_shape[0], image_shape[1], 3))
+        tf.summary.image('output_labels', output_labels)
+
         # Merge all summaries
-        summary_op = tf.summary.merge_all()        
-    
-        if summary_op is not None:
-            train_log = tf.summary.FileWriter(logs_dir, sess.graph)
-            log_summary = True
-    
-    # Initialize variables
+        summary_op = tf.summary.merge_all()
+        train_log = tf.summary.FileWriter(logs_dir, sess.graph)
+
+
     sess.run(tf.global_variables_initializer())
-    # Required by mean_iou
     sess.run(tf.local_variables_initializer())
 
-
-    loss = cross_entropy_loss
     time_elapsed_avg = 0.0
-
     step = 0
     for epoch in range(epochs):
-        
-        for images, gt_images in get_batches_fn(batch_size):            
-            time_start = time.perf_counter()
+        epoch_loss = 0
+        epoch_samples = 0
+        time_start = time.perf_counter()
+
+        for images, gt_images in get_batches_fn(batch_size):
 
             train_feed = {input_image: images,
                           correct_label: gt_images,
-                          keep_prob: 0.8}
+                          keep_prob: 0.75}
+
+            _, batch_loss = sess.run([train_op, loss], feed_dict=train_feed)
 
             if log_summary:
 
-                step_loss, summary, _ = sess.run([loss, summary_op, train_op], feed_dict=train_feed)
-                train_log.add_summary(summary, step)
+                sample_images = helper.generate_street_images(sess, images[:3], logits, keep_prob, input_image, image_shape)
+                sample_labels = tuple(helper.paste_segmentation(images[i], gt_images[i]) for i in range(3))
 
-            else:
-                step_loss, _ = sess.run([loss, train_op], feed_dict=train_feed)
-    
-            if logs_dir and step % 10 == 0:
-                # TODO: Evaluate accuracy on test data
-                # summary, _ = sess.run([summary_op, accuracy], feed_dict=test_feed)
-                # test_writer.add_summary(summary, step)
+                summary_feed = train_feed.copy()
+                summary_feed.update({output_images: sample_images,
+                                     output_labels: sample_labels,
+                                     keep_prob: 1.0})
 
-                time_end = time.perf_counter()
-                time_elapsed = time_end - time_start
-                time_elapsed_avg = (time_elapsed_avg * step + time_elapsed) / (step + 1)
-                time_remaining = datetime.timedelta(seconds=math.ceil((total_steps - step - 1) * time_elapsed_avg))
+                results = sess.run([summary_op], summary_feed)
 
-                logger.info("EPOCH {:3d}...  Step = {:4d}  Loss = {:7.3f}; {:.1f} sec ETA {}".format(
-                    epoch, step, step_loss, time_elapsed, time_remaining))
+                summary = results[0]
+                train_log.add_summary(summary, step)  
 
+            # Accumulated loss
+            n_samples = len(images)
+            epoch_loss += batch_loss * n_samples
+            epoch_samples += n_samples
             step += 1
 
+        epoch_loss /= epoch_samples
+
+        # Logging
+        time_end = time.perf_counter()
+        time_elapsed = time_end - time_start
+        time_elapsed_avg = (time_elapsed_avg * epoch + time_elapsed) / (epoch + 1)
+        time_remaining = datetime.timedelta(seconds=math.ceil((epochs - epoch - 1) * time_elapsed_avg))
+
+        logger.info("EPOCH {:3d}... Loss = {:6.3f}; {:.1f} sec ETA {}".format(
+                    epoch + 1, epoch_loss, time_elapsed, time_remaining))
+
+
 tests.test_train_nn(train_nn)
+
 
 
 def run():
@@ -227,53 +249,27 @@ def run():
     tests.test_for_kitti_dataset(data_dir)
     # Download pretrained vgg model
     helper.maybe_download_pretrained_vgg(data_dir)
+    
+    training_data_dir = os.path.join(data_dir, 'data_road', 'training')
+    testing_data_dir = os.path.join(data_dir, 'data_road', 'testing')
+
+    print("------------------------------------------", flush=True)
+
+    # FLAGS
+    epochs = 100
+    batch_size = 16
+    num_augmented_batches = 100
+
+    # training data size
+    train_size = sum(1 for _ in os.scandir(os.path.join(training_data_dir, 'image_2'))
+                        if _.is_file() and _.name.endswith('.png'))
+    # Total number of batches across all epochs
+    #total_steps = math.ceil(train_size / batch_size) * epochs
+    total_steps = num_augmented_batches * epochs
 
     logger.info("Training...")
 
-    # Flags
-    epochs = 100
-    batch_size = 16
-
-    learning_rate_start = 1e-3
-    learning_rate_decay = 0.1
-    
-    training_data_dir = os.path.join(data_dir, 'data_road', 'training')
-
-    # Step counter during training
-    global_step = tf.Variable(0, trainable=False, name='step')
-
-    if learning_rate_decay:
-        # Total number of batches across all epochs
-        train_size = sum(1 for _ in os.scandir(os.path.join(training_data_dir, 'image_2'))
-                            if _.is_file() and _.name.endswith('.png'))
-        total_steps = math.ceil(train_size / batch_size) * epochs
-
-        # Decay learning rate, once per step, with an exponential schedule.
-        learning_rate = tf.train.exponential_decay(
-           learning_rate_start, 
-           global_step,
-           decay_steps=total_steps, 
-           decay_rate=learning_rate_decay, 
-           staircase=False, 
-           name='learning_rate')
-
-        tf.summary.scalar('learning_rate', learning_rate)
-    else:
-        # Constant learning rate
-        learning_rate = tf.constant(learning_rate_start, dtype=tf.float32)
-
-
-
-    # OPTIONAL: Train and Inference on the cityscapes dataset instead of the Kitti dataset.
-    # You'll need a GPU with at least 10 teraFLOPS to train on.
-    #  https://www.cityscapes-dataset.com/
-
-    # TensorFlow configuration object.
-    config = tf.ConfigProto()
-    # JIT level, this can be set to ON_1 or ON_2 
-    # config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1
-
-    with tf.Session(config=config) as sess:
+    with tf.Session() as sess:
         # Path to vgg model
         vgg_path = os.path.join(data_dir, 'vgg')
         # Create function to get batches
@@ -281,29 +277,53 @@ def run():
 
         # OPTIONAL: Augment Images for better results
         #  https://datascience.stackexchange.com/questions/5224/how-to-prepare-augment-images-for-neural-network
+        get_batches_fn = helper.gen_augmented_batch_function(get_batches_fn, num_augmented_batches)
 
-        # TODO: Build NN using load_vgg, layers, and optimize functions
-        correct_label = tf.placeholder(tf.float32, shape=(None,)+image_shape+(num_classes,), name="correct_label")
+        # Build NN using load_vgg, layers, and optimize function
 
         # Load VGG
         image_input, keep_prob, vgg_layer3_out, vgg_layer4_out, vgg_layer7_out = load_vgg(sess, vgg_path)
+
         # Build FCN-8
         nn_last_layer = layers(vgg_layer3_out, vgg_layer4_out, vgg_layer7_out, num_classes)
+        
         # Build the training operation
+        
+        # Placeholder for the labels
+        correct_label = tf.placeholder(tf.float32, shape=(None, image_shape[0], image_shape[1], num_classes), name='correct_label')
+
+        # Step counter during training
+        global_step = tf.Variable(0, trainable=False, name='step')
+
+        # Decay learning rate, once per step, with an exponential schedule.
+        learning_rate = tf.train.exponential_decay(
+            learning_rate=1e-3, 
+            global_step=global_step,
+            decay_steps=total_steps, 
+            decay_rate=0.3,  # final learning rate = learning * decay_rate 
+            name="learning_rate")
+        tf.summary.scalar("learning_rate", learning_rate)
+
+        # Other option is to keep it constant
+        #learning_rate = tf.constant(5e-4)
+
         logits, train_op, loss = optimize(nn_last_layer, correct_label, learning_rate, num_classes, global_step)
 
         # Train
-        train_nn(sess, epochs, batch_size, get_batches_fn, train_op, loss,
-                 image_input, correct_label, keep_prob, learning_rate, 
-                 logs_dir, total_steps)
-    
-        # TODO: Save inference data using helper.save_inference_samples
-        helper.save_inference_samples(runs_dir, data_dir, sess, image_shape, logits, 
-                                      keep_prob, image_input)
+        extra_kwargs = dict(
+            log_summary=True,
+            logs_dir=logs_dir, 
+            logits=logits, 
+            image_shape=image_shape,
+            testing_data_dir=testing_data_dir)
 
-        # OPTIONAL: Apply the trained model to a video
+        train_nn(sess, epochs, batch_size, get_batches_fn, train_op, loss,
+                 image_input, correct_label, keep_prob, learning_rate, **extra_kwargs)
+
+        # Save inference data using helper.save_inference_samples
+        logger.info("Saving inference samples and checkpoint")
+        helper.save_inference_samples(runs_dir, data_dir, sess, image_shape, logits, keep_prob, image_input)
 
 
 if __name__ == '__main__':
     run()
-    
